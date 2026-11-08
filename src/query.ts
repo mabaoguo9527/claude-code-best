@@ -1,4 +1,17 @@
 // biome-ignore-all assist/source/organizeImports: ANT-ONLY import markers must not be reordered
+/**
+ * query.ts —— Claude Code 核心查询主循环。
+ *
+ * 结构总览：
+ *   query()      对外入口：管理 Langfuse 追踪、结算自治命令、做内存收尾，核心逻辑委托 queryLoop()。
+ *   queryLoop()  循环体（本文绝大部分代码）：消息预处理（工具结果预算/snip/微压缩/折叠/自动压缩）
+ *                → 调用模型并流式消费响应 → 执行工具 → 结果拼回消息 → 重写 state 进入下一轮。
+ *
+ * 返回值 Terminal.reason 概括回合结局：completed / aborted_streaming / aborted_tools /
+ * model_error / prompt_too_long / blocking_limit / max_turns / stop_hook_prevented /
+ * hook_stopped / image_error 等。
+ */
+
 import type {
   ToolResultBlockParam,
   ToolUseBlock,
@@ -13,6 +26,7 @@ import {
   type AutoCompactTrackingState,
 } from './services/compact/autoCompact.js'
 import { buildPostCompactMessages } from './services/compact/compact.js'
+// ===== 按构建 feature 裁剪的可选模块：未启用时为 null，构建期 tree-shaking 直接移除 =====
 /* eslint-disable @typescript-eslint/no-require-imports */
 const reactiveCompact = feature('REACTIVE_COMPACT')
   ? (require('./services/compact/reactiveCompact.js') as typeof import('./services/compact/reactiveCompact.js'))
@@ -64,6 +78,7 @@ import {
   getAttachmentMessages,
   startRelevantMemoryPrefetch,
 } from './utils/attachments.js'
+// ===== 又一批 feature 裁剪模块：技能搜索预取 / 额外工具搜索预取 / 任务分类器 =====
 /* eslint-disable @typescript-eslint/no-require-imports */
 const skillPrefetch = feature('EXPERIMENTAL_SKILL_SEARCH')
   ? (require('./services/skillSearch/prefetch.js') as typeof import('./services/skillSearch/prefetch.js'))
@@ -137,6 +152,7 @@ import {
   shouldShowCacheWarning,
 } from './utils/cacheWarning.js'
 
+// ===== 最后一批 feature 裁剪模块：snip 压缩 / 后台会话任务摘要 =====
 /* eslint-disable @typescript-eslint/no-require-imports */
 const snipModule = feature('HISTORY_SNIP')
   ? (require('./services/compact/snipCompact.js') as typeof import('./services/compact/snipCompact.js'))
@@ -146,6 +162,11 @@ const taskSummaryModule = feature('BG_SESSIONS')
   : null
 /* eslint-enable @typescript-eslint/no-require-imports */
 
+/**
+ * 补齐"缺失的 tool_result"块：遍历助手消息里的每个 tool_use，生成对应的
+ * is_error 合成结果。用于流中断、模型降级、异常退出等场景 —— API 要求
+ * tool_use 与 tool_result 必须一一配对，缺失会导致下一次请求 400。
+ */
 function* yieldMissingToolResultBlocks(
   assistantMessages: AssistantMessage[],
   errorMessage: string,
@@ -191,6 +212,7 @@ function* yieldMissingToolResultBlocks(
  * the rules of thinking are the rules of the universe. If ye does not heed these
  * rules, ye will be punished with an entire day of debugging and hair pulling.
  */
+// 输出截断（max_output_tokens）多轮恢复的最大尝试次数，用尽后放弃并透出错误
 const MAX_OUTPUT_TOKENS_RECOVERY_LIMIT = 3
 
 /**
@@ -202,12 +224,17 @@ const MAX_OUTPUT_TOKENS_RECOVERY_LIMIT = 3
  *
  * Mirrors reactiveCompact.isWithheldPromptTooLong.
  */
+/**
+ * 判断是否为 max_output_tokens 错误消息。这类消息在流式循环中被暂扣不下发，
+ * 等恢复路径（升级重试 / 注入续写消息）确认无望后再透出给调用方。
+ */
 function isWithheldMaxOutputTokens(
   msg: Message | StreamEvent | undefined,
 ): msg is AssistantMessage {
   return msg?.type === 'assistant' && msg.apiError === 'max_output_tokens'
 }
 
+// 把回合结束方式（terminal 状态 / 抛出的错误）归一成自治命令的回合结果枚举
 function getAutonomyTurnOutcome(params: {
   terminal?: Terminal
   thrownError?: unknown
@@ -235,6 +262,7 @@ function getAutonomyTurnOutcome(params: {
   }
 }
 
+// query() 的入参：消息历史、系统/用户上下文、工具权限回调、轮次与预算限制等
 export type QueryParams = {
   messages: Message[]
   systemPrompt: SystemPrompt
@@ -257,6 +285,8 @@ export type QueryParams = {
 
 // -- query loop state
 
+// queryLoop 跨轮携带的可变状态：每轮迭代开头解构读取，
+// 各 continue 点整体重写 `state = { ... }` 推进到下一轮
 // Mutable state carried between loop iterations
 type State = {
   messages: Message[]
@@ -273,6 +303,12 @@ type State = {
   transition: Continue | undefined
 }
 
+/**
+ * query() —— 对外主入口（异步生成器）：跑一轮 queryLoop 并负责全部收尾。
+ * 1. 创建（或复用子代理传入的）Langfuse 追踪，并透传给工具执行；
+ * 2. finally 中按回合结局结算自治命令、结束追踪、释放大对象引用与原生缓冲；
+ * 3. 正常返回时把本回合消费的排队命令回调为 completed。
+ */
 export async function* query(
   params: QueryParams,
 ): AsyncGenerator<
@@ -283,12 +319,14 @@ export async function* query(
   | ToolUseSummaryMessage,
   Terminal
 > {
+  // 本回合消费的排队命令记录（uuid 与命令本体），回合结束时用于生命周期回调
   const consumedCommandUuids: string[] = []
   const consumedAutonomyCommands: QueuedCommand[] = []
 
   // Create Langfuse trace for this query turn (no-op if not configured).
   // When called as a sub-agent, langfuseTrace is already set by runAgent()
   // — reuse it instead of creating an independent trace.
+  // ===== Langfuse 追踪：子代理复用上层已建的 trace，只有创建者才负责新建与结束 =====
   const ownsTrace = !params.toolUseContext.langfuseTrace
   logForDebugging(
     `[query] ownsTrace=${ownsTrace} incoming langfuseTrace=${params.toolUseContext.langfuseTrace ? 'present' : 'null/undefined'} isLangfuseEnabled=${isLangfuseEnabled()}`,
@@ -313,6 +351,7 @@ export async function* query(
       }
     : params
 
+  // 执行主循环；无论正常返回还是抛错，finally 中的收尾逻辑都会执行
   let terminal: Terminal | undefined
   let didThrow = false
   let thrownError: unknown
@@ -327,6 +366,7 @@ export async function* query(
     thrownError = error
     throw error
   } finally {
+    // ===== 收尾①：按回合结局（完成/取消/失败）结算自治命令，未消费的重新入队 =====
     await finalizeAutonomyCommandsForTurn({
       commands: consumedAutonomyCommands,
       outcome: getAutonomyTurnOutcome({
@@ -343,6 +383,7 @@ export async function* query(
       .catch(logError)
 
     // Only end the trace if we created it — sub-agents own their traces
+    // ===== 收尾②：结束 Langfuse 追踪并 flush（仅由创建者执行） =====
     if (ownsTrace) {
       const isAborted =
         terminal?.reason === 'aborted_streaming' ||
@@ -358,6 +399,7 @@ export async function* query(
     // Break the closure chain: toolUseContext captures langfuseTrace which
     // holds SpanImpl → otperformance (the 571MB Performance object). Nulling
     // these after endTrace allows GC to reclaim the span tree.
+    // ===== 收尾③：置空 trace 引用，打断闭包引用链，让 GC 回收巨型 Span 树 =====
     if (paramsWithTrace !== params) {
       paramsWithTrace.toolUseContext.langfuseTrace = null
       paramsWithTrace.toolUseContext.langfuseRootTrace = null
@@ -368,6 +410,7 @@ export async function* query(
     // globalThis.performance which stores marks/measures/resource timings in a
     // C++ Vector that never shrinks. Long-running sessions accumulate hundreds
     // of MB of dead capacity even after spans are flushed and nullified.
+    // ===== 收尾④：清空 JSC 原生 Performance 缓冲，防止长会话内存持续膨胀 =====
     const gPerf = globalThis.performance
     if (gPerf && typeof gPerf.clearMarks === 'function') {
       try {
@@ -384,12 +427,21 @@ export async function* query(
   // propagates through yield*) and on .return() (Return completion closes
   // both generators). This gives the same asymmetric started-without-completed
   // signal as print.ts's drainCommandQueue when the turn fails.
+  // 只有 queryLoop 正常返回才会走到这里（抛错/.return 会跳过）：
+  // 把消费过的命令通知为 completed，与失败路径形成 started-without-completed 的不对称语义
   for (const uuid of consumedCommandUuids) {
     notifyCommandLifecycle(uuid, 'completed')
   }
   return terminal!
 }
 
+/**
+ * queryLoop() —— 查询主循环的真正实现。
+ * 每轮迭代依次完成：消息预处理（预算裁剪 → snip → 微压缩 → 折叠 → 自动压缩）→
+ * 组装请求调用模型并流式消费响应 → 执行工具并下发结果 →
+ * 把助手消息与工具结果拼回消息列表，重写 state 后进入下一轮。
+ * 没有函数递归 —— 所有"续跑"都通过 `state = { ... }; continue` 实现。
+ */
 async function* queryLoop(
   params: QueryParams,
   consumedCommandUuids: string[],
@@ -402,6 +454,7 @@ async function* queryLoop(
   | ToolUseSummaryMessage,
   Terminal
 > {
+  // ===== 一、初始化 =====
   // Immutable params — never reassigned during the query loop.
   const {
     systemPrompt,
@@ -415,9 +468,7 @@ async function* queryLoop(
   } = params
   const deps = params.deps ?? productionDeps()
 
-  // Mutable cross-iteration state. The loop body destructures this at the top
-  // of each iteration so reads stay bare-name (`messages`, `toolUseContext`).
-  // Continue sites write `state = { ... }` instead of 9 separate assignments.
+  // 初始化跨轮可变状态
   let state: State = {
     messages: params.messages,
     toolUseContext: params.toolUseContext,
@@ -430,27 +481,18 @@ async function* queryLoop(
     pendingToolUseSummary: undefined,
     transition: undefined,
   }
+  // Token 预算追踪器（feature 门控，关闭时为 null）
   const budgetTracker = feature('TOKEN_BUDGET') ? createBudgetTracker() : null
 
-  // task_budget.remaining tracking across compaction boundaries. Undefined
-  // until first compact fires — while context is uncompacted the server can
-  // see the full history and handles the countdown from {total} itself (see
-  // api/api/sampling/prompt/renderer.py:292). After a compact, the server sees
-  // only the summary and would under-count spend; remaining tells it the
-  // pre-compact final window that got summarized away. Cumulative across
-  // multiple compacts: each subtracts the final context at that compact's
-  // trigger point. Loop-local (not on State) to avoid touching the 7 continue
-  // sites.
+  // task_budget 剩余额度：上下文未压缩时服务端能看全量历史、自行倒计数；
+  // 一旦压缩，服务端只能看到摘要，需要这里显式传剩余量（跨多次压缩累减）
   let taskBudgetRemaining: number | undefined
 
-  // Snapshot immutable env/statsig/session state once at entry. See QueryConfig
-  // for what's included and why feature() gates are intentionally excluded.
+  // 入口处一次性快照环境/会话配置（刻意不含 feature() 门控项）
   const config = buildQueryConfig()
 
-  // Fired once per user turn — the prompt is invariant across loop iterations,
-  // so per-iteration firing would ask sideQuery the same question N times.
-  // Consume point polls settledAt (never blocks). `using` disposes on all
-  // generator exit paths — see MemoryPrefetch for dispose/telemetry semantics.
+  // 记忆预取：每个用户回合只发起一次（prompt 跨迭代不变），趁模型流式期间后台查询，
+  // 消费点零等待轮询；`using` 保证生成器所有退出路径上都会正确释放
   using pendingMemoryPrefetch = startRelevantMemoryPrefetch(
     state.messages,
     state.toolUseContext,
@@ -458,6 +500,7 @@ async function* queryLoop(
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
+    // ===== 每轮迭代开始：解构 state（仅 toolUseContext 会在本轮内被重新赋值） =====
     // Destructure state at the top of each iteration. toolUseContext alone
     // is reassigned within an iteration (queryTracking, messages updates);
     // the rest are read-only between continue sites.
@@ -473,6 +516,7 @@ async function* queryLoop(
       turnCount,
     } = state
 
+    // ===== 技能/额外工具发现预取：每轮发起，趁模型流式与工具执行期间并行完成 =====
     // Skill discovery prefetch — per-iteration (uses findWritePivot guard
     // that returns early on non-write iterations). Discovery runs while the
     // model streams and tools execute; awaited post-tools alongside the
@@ -492,6 +536,7 @@ async function* queryLoop(
         messages,
       )
 
+    // 通知下游：本轮流式请求开始；随后记录 profiler / 无头模式检查点
     yield { type: 'stream_request_start' }
 
     queryCheckpoint('query_fn_entry')
@@ -501,6 +546,7 @@ async function* queryLoop(
       headlessProfilerCheckpoint('query_started')
     }
 
+    // ===== 查询链追踪：同一回合内深度+1，新回合开新链，用于分析埋点 =====
     // Initialize or increment query chain tracking
     const queryTracking = toolUseContext.queryTracking
       ? {
@@ -520,8 +566,14 @@ async function* queryLoop(
       queryTracking,
     }
 
+    // ===== 二、消息预处理管道（以下 ①~⑦ 顺序执行，层层收缩上下文） =====
+    // ① 只保留压缩边界之后的消息
     let messagesForQuery = getMessagesAfterCompactBoundary(messages)
 
+    // ② 浅拷贝剥离上一轮 toolUseResult 原始负载：API 只需要 tool_result 块，
+    //    原始输出对象仅供 UI 渲染，留着会让长会话内存无限增长。
+    //    必须拷贝而非原地删除 —— 消息与 UI 状态共享引用，原地改会把正在渲染的
+    //    工具结果行变成空白
     // Release toolUseResult payloads from previous turns — the next API call
     // only needs message.message.content (tool_result blocks), not the raw
     // output object. This prevents unbounded memory growth in long sessions
@@ -552,8 +604,11 @@ async function* queryLoop(
       return copy
     })
 
+    // 自动压缩追踪状态（跨轮保留）
     let tracking = autoCompactTracking
 
+    // ③ 工具结果预算：限制聚合后的工具结果体积（先于微压缩执行，二者互不干扰）；
+    //    仅对会读回记录的 querySource（子代理/主线程会话）持久化替换记录
     // Enforce per-message budget on aggregate tool result size. Runs BEFORE
     // microcompact — cached MC operates purely by tool_use_id (never inspects
     // content), so content replacement is invisible to it and the two compose
@@ -581,6 +636,8 @@ async function* queryLoop(
       ),
     )
 
+    // ④ Snip 压缩（HISTORY_SNIP）：按条裁剪可牺牲的旧历史；
+    //    释放的 token 数要传给自动压缩阈值判断（仅靠 usage 估算看不到）
     // Apply snip before microcompact (both may run — they are not mutually exclusive).
     // snipTokensFreed is plumbed to autocompact so its threshold check reflects
     // what snip removed; tokenCountWithEstimation alone can't see it (reads usage
@@ -597,6 +654,8 @@ async function* queryLoop(
       queryCheckpoint('query_snip_end')
     }
 
+    // ⑤ 微压缩：只压缩工具结果等小块；被清空的工具同步删除其内容替换记录。
+    //    缓存式微压缩的边界消息推迟到拿到 API 实报删除量后再补发
     // Apply microcompact before autocompact
     queryCheckpoint('query_microcompact_start')
     const microcompactResult = await deps.microcompact(
@@ -623,6 +682,8 @@ async function* queryLoop(
       : undefined
     queryCheckpoint('query_microcompact_end')
 
+    // ⑥ 上下文折叠（CONTEXT_COLLAPSE）：读时投影折叠视图并按需提交新折叠；
+    //    先于自动压缩执行 —— 若折叠已足够省，就保留细粒度上下文而非整段摘要
     // Project the collapsed context view and maybe commit more collapses.
     // Runs BEFORE autocompact so that if collapse gets us under the
     // autocompact threshold, autocompact is a no-op and we keep granular
@@ -644,10 +705,12 @@ async function* queryLoop(
       messagesForQuery = collapseResult.messages
     }
 
+    // ===== 组装最终系统提示词（系统提示 + 系统上下文） =====
     const fullSystemPrompt = asSystemPrompt(
       appendSystemContext(systemPrompt, systemContext),
     )
 
+    // ⑦ 自动压缩：上下文逼近阈值时，用一次模型调用把历史总结成摘要
     queryCheckpoint('query_autocompact_start')
     const { compactionResult, consecutiveFailures } = await deps.autocompact(
       messagesForQuery,
@@ -665,6 +728,8 @@ async function* queryLoop(
     )
     queryCheckpoint('query_autocompact_end')
 
+    // ===== 压缩成功：上报埋点、记录压缩前的 task_budget 窗口、重置追踪状态，
+    //      然后用压缩后的消息继续本轮请求 =====
     if (compactionResult) {
       const {
         preCompactTokenCount,
@@ -740,12 +805,16 @@ async function* queryLoop(
       }
     }
 
+    // 把最新消息列表同步进工具上下文
     //TODO: no need to set toolUseContext.messages during set-up since it is updated here
     toolUseContext = {
       ...toolUseContext,
       messages: messagesForQuery,
     }
 
+    // ===== 三、本轮响应收集器 =====
+    // needsFollowUp：流中出现过 tool_use 就置 true —— 这是唯一的"继续循环"信号
+    // （stop_reason 字段不可靠，见下方英文注释）
     const assistantMessages: AssistantMessage[] = []
     const toolResults: (UserMessage | AttachmentMessage)[] = []
     // @see https://docs.claude.com/en/docs/build-with-claude/tool-use
@@ -755,6 +824,7 @@ async function* queryLoop(
     const toolUseBlocks: ToolUseBlock[] = []
     let needsFollowUp = false
 
+    // ===== 本轮执行环境：按 feature 决定是否用流式工具执行器；按权限模式/上下文规模选模型 =====
     queryCheckpoint('query_setup_start')
     const useStreamingToolExecution = config.gates.streamingToolExecution
     let streamingToolExecutor = useStreamingToolExecution
@@ -777,6 +847,8 @@ async function* queryLoop(
 
     queryCheckpoint('query_setup_end')
 
+    // ===== 请求体转储 fetch 包装：整个 query 会话只创建一次，只保留最近一个
+    //      请求体，避免闭包逐请求累积造成数百 MB 内存占用 =====
     // Create fetch wrapper once per query session to avoid memory retention.
     // Each call to createDumpPromptsFetch creates a closure that captures the request body.
     // Creating it once means only the latest request body is retained (~700KB),
@@ -787,6 +859,11 @@ async function* queryLoop(
       ? createDumpPromptsFetch(toolUseContext.agentId ?? config.sessionId)
       : undefined
 
+    // ===== 硬性阻塞上限检查（仅自动压缩关闭时生效）：为手动 /compact 预留空间，
+    //      超限则直接下发 prompt-too-long 错误并结束。以下情况跳过：
+    //      刚压缩过 / snip 刚省出空间（旧 usage 已过期，会误判）、
+    //      compact/session_memory 派生代理（越压越少，阻塞会死锁）、
+    //      响应式压缩或上下文折叠可用（它们需要真实 413 才能触发恢复） =====
     // Block if we've hit the hard blocking limit (only applies when auto-compact is OFF)
     // This reserves space so users can still run /compact manually
     // Skip this check if compaction just happened - the compaction result is already
@@ -845,6 +922,7 @@ async function* queryLoop(
       }
     }
 
+    // ===== 预测性自动压缩：估算本轮增长会顶爆有效上下文窗口时，提前压缩 =====
     // Predictive autocompact: estimate if this turn's growth will push
     // us past the context window. Uses effectiveContextWindow directly
     // (without the autocompact buffer) to avoid double-reserving with
@@ -887,6 +965,8 @@ async function* queryLoop(
       }
     }
 
+    // ===== 四、调用模型并流式消费响应 =====
+    // attemptWithFallback：遇 FallbackTriggeredError 时换备用模型整体重试一次
     let attemptWithFallback = true
 
     queryCheckpoint('query_api_loop_start')
@@ -896,6 +976,7 @@ async function* queryLoop(
         try {
           let streamingFallbackOccured = false
           queryCheckpoint('query_api_streaming_start')
+          // 发起流式请求并逐条消费消息/事件
           for await (const message of deps.callModel({
             messages: prependUserContext(messagesForQuery, userContext),
             systemPrompt: fullSystemPrompt,
@@ -947,6 +1028,9 @@ async function* queryLoop(
               langfuseTrace: toolUseContext.langfuseTrace,
             },
           })) {
+            // ===== 流式降级发生：之前的半成品作废 —— 孤儿消息墓碑化（无效签名的
+            //      thinking 块会引发 API 报错），清空收集器，丢弃未完成的工具结果并
+            //      重建执行器，避免旧 tool_use_id 的孤儿结果混入降级后的响应 =====
             // We won't use the tool_calls from the first attempt
             // We could.. but then we'd have to merge assistant messages
             // with different ids and double up on full the tool_results
@@ -980,6 +1064,8 @@ async function* queryLoop(
                 )
               }
             }
+            // ===== 在克隆消息上回填 tool_use 输入的派生/可观察字段后再下发；
+            //      原始消息不动（要回传 API，改动会破坏 prompt cache 的字节一致性） =====
             // Backfill tool_use inputs on a cloned message before yield so
             // SDK stream output and transcript serialization see legacy/derived
             // fields. The original `message` is left untouched for
@@ -1038,6 +1124,9 @@ async function* queryLoop(
                 } as typeof message
               }
             }
+            // ===== 可恢复错误（prompt-too-long / 媒体超限 / 输出截断）暂扣不下发：
+            //      先进入后面的恢复判定，恢复无望时才透出。仍会推入
+            //      assistantMessages，供恢复逻辑识别 =====
             // Withhold recoverable errors (prompt-too-long, max-output-tokens)
             // until we know whether recovery (collapse drain / reactive
             // compact / truncation retry) can succeed. Still pushed to
@@ -1076,6 +1165,7 @@ async function* queryLoop(
             if (!withheld) {
               yield yieldMessage
             }
+            // ===== 收集助手消息：提取 tool_use 块；未中止时交给流式执行器提前开工 =====
             if (message.type === 'assistant') {
               const assistantMessage = message as AssistantMessage
               assistantMessages.push(assistantMessage)
@@ -1102,6 +1192,7 @@ async function* queryLoop(
               }
             }
 
+            // ===== 边流边收：流式执行器里已完成的工具结果立即下发并入列 =====
             if (
               streamingToolExecutor &&
               !toolUseContext.abortController.signal.aborted
@@ -1121,6 +1212,8 @@ async function* queryLoop(
           }
           queryCheckpoint('query_api_streaming_end')
 
+          // ===== 缓存式微压缩收尾：用 API 实报的 cache_deleted_input_tokens
+          //      （减去请求前基线得到增量）补发边界消息 =====
           // Yield deferred microcompact boundary message using actual API-reported
           // token deletion count instead of client-side estimates.
           // Entire block gated behind feature() so the excluded string
@@ -1149,6 +1242,9 @@ async function* queryLoop(
             }
           }
         } catch (innerError) {
+          // ===== 模型降级（FallbackTriggeredError）：切换备用模型并整轮重试。
+          //      清理上一轮尝试的所有产物（补缺失结果、重置收集器与执行器）；
+          //      内部模型还要剥离 thinking 签名（签名与模型绑定，跨模型重放会 400） =====
           if (innerError instanceof FallbackTriggeredError && fallbackModel) {
             // Fallback was triggered - switch model and retry
             currentModel = fallbackModel
@@ -1211,6 +1307,8 @@ async function* queryLoop(
         }
       }
     } catch (error) {
+      // ===== 模型调用失败兜底（降级重试之外的错误）：补齐缺失 tool_result、
+      //      透出真实错误（而非误导性的"用户中断"）、记录日志后以 model_error 结束 =====
       logError(error)
       const errorMessage =
         error instanceof Error ? error.message : String(error)
@@ -1283,6 +1381,7 @@ async function* queryLoop(
       }
     }
 
+    // ===== post-sampling 钩子：模型响应完整后异步触发，不阻塞主流程 =====
     // Execute post-sampling hooks after model response is complete
     if (assistantMessages.length > 0) {
       void executePostSamplingHooks(
@@ -1295,6 +1394,9 @@ async function* queryLoop(
       )
     }
 
+    // ===== 流式阶段被中断：必须最先处理。流式执行器要消费完剩余结果以生成
+    //      合成 tool_result（否则 tool_use 没有配对结果）；随后清理 CU 状态、
+    //      下发中断消息，以 aborted_streaming 结束 =====
     // We need to handle a streaming abort before anything else.
     // When using streamingToolExecutor, we must consume getRemainingResults() so the
     // executor can generate synthetic tool_result blocks for queued/in-progress tools.
@@ -1339,6 +1441,7 @@ async function* queryLoop(
     }
 
     // Yield tool use summary from previous turn — haiku (~1s) resolved during model streaming (5-30s)
+    // ===== 上轮发起的工具摘要生成（Haiku，约 1s）此刻应已就绪，顺路下发 =====
     if (pendingToolUseSummary) {
       const summary = await pendingToolUseSummary
       if (summary) {
@@ -1346,9 +1449,14 @@ async function* queryLoop(
       }
     }
 
+    // ===== 五、回合结束分支：模型没有再调工具。依次处理：被暂扣错误的恢复、
+    //      输出截断恢复、API 错误收尾、stop 钩子、token 预算，最后正常结束 =====
     if (!needsFollowUp) {
       const lastMessage = assistantMessages.at(-1)
 
+      // ===== 恢复被暂扣的 413（prompt too long）与媒体超限错误：
+      //      先试折叠排水（便宜、保留细粒度上下文），不行再试响应式压缩（整摘要）。
+      //      各只有一次机会，仍失败则透出错误并结束（避免继续烧 API） =====
       // Prompt-too-long recovery: the streaming loop withheld the error
       // (see withheldByCollapse / withheldByReactive above). Try collapse
       // drain first (cheap, keeps granular context), then reactive compact
@@ -1469,6 +1577,8 @@ async function* queryLoop(
         return { reason: 'prompt_too_long' }
       }
 
+      // ===== 输出截断恢复：先试一次 8k→64k 的升级重试（无提示直接重放同一请求），
+      //      再注入"从中断处继续写"的元消息做多轮恢复（上限 3 次），全失败才透出 =====
       // Check for max_output_tokens and inject recovery message. The error
       // was withheld from the stream above; only surface it if recovery
       // exhausts.
@@ -1542,6 +1652,8 @@ async function* queryLoop(
         yield lastMessage
       }
 
+      // ===== API 错误收尾：跳过 stop 钩子（模型没有产出有效响应，钩子评估只会
+      //      造成 错误→阻塞→重试→错误 的死亡螺旋），触发失败钩子后返回 =====
       // Skip stop hooks when the last message is an API error (rate limit,
       // prompt-too-long, auth failure, etc.). The model never produced a
       // real response — hooks evaluating it create a death spiral:
@@ -1554,6 +1666,8 @@ async function* queryLoop(
         }
       }
 
+      // ===== Stop 钩子：可以拦截结束（preventContinuation），也可以用阻塞错误
+      //      把控制权交回模型再跑一轮 =====
       const stopHookResult = yield* handleStopHooks(
         messagesForQuery,
         assistantMessages,
@@ -1595,6 +1709,8 @@ async function* queryLoop(
         continue
       }
 
+      // ===== Token 预算续跑（TOKEN_BUDGET）：未达预算且仍有产出价值时注入
+      //      推进元消息继续；收敛/边际递减时记录完成事件 =====
       if (feature('TOKEN_BUDGET')) {
         const decision = checkTokenBudget(
           budgetTracker!,
@@ -1647,6 +1763,7 @@ async function* queryLoop(
       return { reason: 'completed' }
     }
 
+    // ===== 六、工具执行：消费流式执行器的剩余结果，或走常规 runTools 编排 =====
     let shouldPreventContinuation = false
     let updatedToolUseContext = toolUseContext
 
@@ -1666,6 +1783,7 @@ async function* queryLoop(
       })
     }
 
+    // 统一出口：逐个下发工具结果、捕获 hook_stopped_continuation、合并新上下文
     const toolUpdates = streamingToolExecutor
       ? streamingToolExecutor.getRemainingResults()
       : runTools(toolUseBlocks, assistantMessages, canUseTool, toolUseContext)
@@ -1697,6 +1815,8 @@ async function* queryLoop(
     }
     queryCheckpoint('query_tool_execution_end')
 
+    // ===== 为刚完成的这批工具生成使用摘要：异步发起不阻塞下一次 API 调用，
+    //      下一轮迭代开始时再下发 =====
     // Generate tool use summary after tool batch completes — passed to next recursive call
     let nextPendingToolUseSummary:
       | Promise<ToolUseSummaryMessage | null>
@@ -1775,6 +1895,8 @@ async function* queryLoop(
         .catch(() => null)
     }
 
+    // ===== 工具执行期间被中断：清理 CU 状态、下发中断消息，按需上报
+    //      max_turns 后以 aborted_tools 结束 =====
     // We were aborted during tool calls
     if (toolUseContext.abortController.signal.aborted) {
       // chicago MCP: auto-unhide + lock release when aborted mid-tool-call.
@@ -1809,11 +1931,13 @@ async function* queryLoop(
       return { reason: 'aborted_tools' }
     }
 
+    // 钩子要求停止续跑
     // If a hook indicated to prevent continuation, stop here
     if (shouldPreventContinuation) {
       return { reason: 'hook_stopped' }
     }
 
+    // ===== 压缩后的轮次计数埋点 =====
     if (tracking?.compacted) {
       tracking.turnCounter++
       logEvent('tengu_post_autocompact_turn', {
@@ -1838,6 +1962,8 @@ async function* queryLoop(
       queryDepth: queryTracking.depth,
     })
 
+    // ===== 七、排队命令与附件注入：捞出本线程/本子代理待处理的命令并认领，
+    //      转成附件让模型在本轮就能响应（斜杠命令除外，它们必须走回合后的处理流程） =====
     // Get queued commands snapshot before processing attachments.
     // These will be sent as attachments so Claude can respond to them in the current turn.
     //
@@ -1891,6 +2017,7 @@ async function* queryLoop(
       removeFromQueue(claimedConsumedCommands)
     }
 
+    // 附件消息逐条下发并入列（必须排在 tool_result 之后，API 不允许交错普通消息）
     for await (const attachment of getAttachmentMessages(
       null,
       updatedToolUseContext,
@@ -1903,6 +2030,8 @@ async function* queryLoop(
       toolResults.push(attachment)
     }
 
+    // ===== 记忆预取消费：仅当已就绪且从未消费过（零等待，本轮没就绪就下轮再试）；
+    //      用 readFileState 过滤模型已经读/写/编辑过的记忆 =====
     // Memory prefetch consume: only if settled and not already consumed on
     // an earlier iteration. If not settled yet, skip (zero-wait) and retry
     // next iteration — the prefetch gets as many chances as there are loop
@@ -1927,6 +2056,7 @@ async function* queryLoop(
       pendingMemoryPrefetch.consumedOnIteration = turnCount - 1
     }
 
+    // ===== 注入技能发现预取结果 =====
     // Inject prefetched skill discovery. collectSkillDiscoveryPrefetch emits
     // hidden_by_main_turn — true when the prefetch resolved before this point
     // (should be >98% at AKI@250ms / Haiku@573ms vs turn durations of 2-30s).
@@ -1940,6 +2070,7 @@ async function* queryLoop(
       }
     }
 
+    // ===== 注入额外工具发现预取结果 =====
     // Inject prefetched tool discovery.
     if (searchExtraToolsPrefetch && pendingToolPrefetch) {
       const toolAttachments =
@@ -1953,6 +2084,7 @@ async function* queryLoop(
       }
     }
 
+    // ===== 从队列移除真正被消费的命令，并回调生命周期 started =====
     // Remove only commands that were actually consumed as attachments.
     // Prompt and task-notification commands are converted to attachments above.
     const claimedCommandSet = new Set(claimedConsumedCommands)
@@ -1971,6 +2103,7 @@ async function* queryLoop(
       removeFromQueue(consumedCommands)
     }
 
+    // ===== 埋点：附件注入后的结果规模 =====
     // Instrumentation: Track file change attachments after they're added
     const fileChangeAttachmentCount = count(
       toolResults,
@@ -1985,6 +2118,7 @@ async function* queryLoop(
       queryDepth: queryTracking.depth,
     })
 
+    // ===== 轮间刷新工具列表：让本轮期间新连接的 MCP server 生效 =====
     // Refresh tools between turns so newly-connected MCP servers become available
     if (updatedToolUseContext.options.refreshTools) {
       const refreshedTools = updatedToolUseContext.options.refreshTools()
@@ -2007,6 +2141,8 @@ async function* queryLoop(
     // Each time we have tool results and are about to recurse, that's a turn
     const nextTurnCount = turnCount + 1
 
+    // ===== 后台会话任务摘要（BG_SESSIONS）：长任务中途刷新"正在做什么"，
+    //      仅主线程生成，子代理不参与 =====
     // Periodic task summary for `claude ps` — fires mid-turn so a
     // long-running agent still refreshes what it's working on. Gated
     // only on !agentId so every top-level conversation (REPL, SDK, HFI,
@@ -2029,6 +2165,7 @@ async function* queryLoop(
       }
     }
 
+    // ===== 轮次上限检查：超过 maxTurns 则上报并以 max_turns 结束 =====
     // Check if we've reached the max turns limit
     if (maxTurns && nextTurnCount > maxTurns) {
       yield createAttachmentMessage({
@@ -2039,6 +2176,7 @@ async function* queryLoop(
       return { reason: 'max_turns', turnCount: nextTurnCount }
     }
 
+    // ===== 八、组装下一轮状态：消息 = 历史 + 助手消息 + 工具结果/附件，继续循环 =====
     queryCheckpoint('query_recursive_call')
     const next: State = {
       messages: messagesForQuery.concat(assistantMessages, toolResults),
