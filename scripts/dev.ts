@@ -6,6 +6,7 @@
  */
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
+// @ts-expect-error
 import { getMacroDefines, DEFAULT_BUILD_FEATURES } from './defines.ts'
 
 // Resolve project root from this script's location

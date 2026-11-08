@@ -1,6 +1,8 @@
 import { readdir, readFile, writeFile, cp } from 'fs/promises'
 import { join } from 'path'
+// @ts-expect-error
 import { getMacroDefines } from './scripts/defines.ts'
+// @ts-expect-error
 import { DEFAULT_BUILD_FEATURES } from './scripts/defines.ts'
 
 const outdir = 'dist'
