@@ -2,6 +2,10 @@ import memoize from 'lodash-es/memoize.js'
 import { homedir } from 'os'
 import { join } from 'path'
 
+// 【配置根目录】配置/会话/记忆/备份的存放根目录：
+//   优先环境变量 CLAUDE_CONFIG_DIR，否则默认 ~/.claude
+// ⚠️ CCB 与官方 Claude Code 共用同一目录（README 宣称完全兼容 CC 配置），
+//   因此两个工具的会话历史（projects/）、settings 会互相可见
 // Memoized: 150+ callers, many on hot paths. Keyed off CLAUDE_CONFIG_DIR so
 // tests that change the env var get a fresh value without explicit cache.clear.
 export const getClaudeConfigHomeDir = memoize(

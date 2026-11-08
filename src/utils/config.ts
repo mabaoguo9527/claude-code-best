@@ -1339,6 +1339,22 @@ function saveConfigWithLock<A extends object>(
 // Flag to track if config reading is allowed
 let configReadingAllowed = false
 
+/**
+ * 【配置系统开关】允许全仓库读取配置的"开门人"。
+ *
+ * 为什么存在：配置读取被禁止发生在模块初始化阶段（import 时）——
+ * 那会拖慢启动，并引发 import 顺序相关的隐性 bug。所以在开门之前
+ * 读配置的代码会触发 console 警告（configReadingAllowed 未置位）。
+ * 各入口显式调用本函数（如 cli.tsx 的 --dump-system-prompt 快速路径、
+ * daemon 子命令），之后全仓库的配置读取才算"合法"。
+ *
+ * 行为：
+ *   1. 幂等：已开门则直接返回
+ *   2. 置位 configReadingAllowed，解除读配置警告
+ *   3. 立即预读全局配置文件 ~/.claude.json（throw on invalid——
+ *      配置损坏尽早在这里抛错，而不是运行到一半才炸）
+ *   4. 打点 enable_configs_started/completed（启动性能归因）
+ */
 export function enableConfigs(): void {
   if (configReadingAllowed) {
     // Ensure this is idempotent
