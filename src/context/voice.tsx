@@ -19,7 +19,9 @@ const DEFAULT_STATE: VoiceState = {
 
 type VoiceStore = Store<VoiceState>;
 
-const VoiceContext = createContext<VoiceStore | null>(null);
+// Exported so the VOICE_MODE-off noop provider in state/AppState.tsx can wrap
+// children in this same context (it requires this module dynamically).
+export const VoiceContext = createContext<VoiceStore | null>(null);
 
 type Props = {
   children: React.ReactNode;

@@ -1,3 +1,23 @@
 [test]
 root = "."
 timeout = 10000
+
+# 运行期 define（bun 直接执行 TS 时生效）。与 scripts/dev.ts 的 -d 注入等值；
+# dev/build 仍以各自显式传入的 defines 为准（CLI -d / Bun.build define 优先）。
+# 放这里是为了让 IDE（WebStorm Bun 配置）直接启动 cli.tsx 时无需在参数里传引号——
+# IDE 参数框会剥掉双引号，导致 -d 的 JSON 值解析失败（error: Unexpected 2.8.4）。
+#
+# 注意：故意不放 process.env.NODE_ENV——bunfig define 是转译期文本替换，
+# bun test 下也会把源码里的 process.env.NODE_ENV 硬替换成 "production"，
+# 击穿 `NODE_ENV !== 'test'` 守卫（如 bootstrap/state.ts resetStateForTests）。
+# IDE 场景需要 NODE_ENV=production 时，用运行时环境变量传入（WebStorm
+# Environment variables 填 NODE_ENV=production），React 的 dev/prod 分支
+# 在未做 define 替换时按运行时值走，效果等价且不污染 bun test。
+[define]
+"MACRO.VERSION" = '"2.8.4"'
+"MACRO.BUILD_TIME" = '"debug-fixed"'
+"MACRO.FEEDBACK_CHANNEL" = '""'
+"MACRO.ISSUES_EXPLAINER" = '""'
+"MACRO.NATIVE_PACKAGE_URL" = '""'
+"MACRO.PACKAGE_URL" = '""'
+"MACRO.VERSION_CHANGELOG" = '""'
