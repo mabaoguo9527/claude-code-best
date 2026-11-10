@@ -2740,14 +2740,35 @@ export function filterToBundledAndMcp(commands: Command[]): Command[] {
   return filtered
 }
 
+/**
+ * 生成 skill_listing 附件 —— 模型可见的「skill 通讯录」。
+ *
+ * 【skill 内容从哪些目录来】本函数只调 getSkillToolCommands(cwd) 拿现成清单，
+ * 真正的磁盘扫描在 skills/loadSkillsDir.ts 的 getSkillDirCommands（memoized）：
+ *   1. 用户级      ~/.claude/skills/
+ *   2. 项目级      从 cwd 向上一路到 HOME，每级的 .claude/skills/（monorepo 祖先目录都会扫）
+ *   3. 托管/策略级 <managed-settings>/.claude/skills/（企业下发；CLAUDE_CODE_DISABLE_POLICY_SKILLS=1 关闭）
+ *   4. 捆绑内置    代码内同步注册（getBundledSkills，不扫盘）
+ *   5. 插件        已启用插件的 skills 目录（getPluginSkills）+ 内置插件 skill
+ *   6. 兼容来源    legacy commands/ 目录、--add-dir 额外目录
+ * 随后 getMcpSkillCommands 把 MCP 服务器声明的 skill 并入（uniqBy 按名去重）。
+ * 【注意】EXPERIMENTAL_SKILL_SEARCH 开启时，下面会把清单过滤成只剩
+ * bundled + MCP —— 用户/项目/插件 skill 故意不进清单，走 skill_discovery
+ * 按意图匹配出现（见 filterToBundledAndMcp 注释）。
+ *
+ * 【增量协议】按 agentId 维护已发送名单（sentSkillNames）：会话首轮发全量
+ * （isInitial），之后只发新增（/reload-plugins 等带来的动态 skill）；
+ * resume 时把现存全部标记为已发送（suppressNext），避免重启后重发整个清单。
+ */
 async function getSkillListingAttachments(
   toolUseContext: ToolUseContext,
 ): Promise<Attachment[]> {
+  // 测试环境不注入清单，避免污染快照/断言
   if (process.env.NODE_ENV === 'test') {
     return []
   }
 
-  // Skip skill listing for agents that don't have the Skill tool — they can't use skills directly.
+  // 没有 Skill 工具的 agent（如精简子代理）用不了 skill，直接跳过
   if (
     !toolUseContext.options.tools.some(t => toolMatchesName(t, SKILL_TOOL_NAME))
   ) {
@@ -2771,6 +2792,7 @@ async function getSkillListingAttachments(
   // MCP are small and intent-signaled; user/project/plugin skills go through
   // discovery. feature() first for DCE — the property-access string leaks
   // otherwise even with ?. on null.
+  // skill search 开启：清单收敛为 bundled + MCP（用户/项目/插件 skill 走 discovery 按需出现）
   if (
     feature('EXPERIMENTAL_SKILL_SEARCH') &&
     skillSearchModules?.featureCheck.isSkillSearchEnabled()
@@ -2778,6 +2800,8 @@ async function getSkillListingAttachments(
     allCommands = filterToBundledAndMcp(allCommands)
   }
 
+  // 按 agent 隔离的已发送名单：主线程 agentId 为 ''，各子代理有自己的 id，
+  // 各自维护各自的增量（互不串扰）
   const agentKey = toolUseContext.agentId ?? ''
   let sent = sentSkillNames.get(agentKey)
   if (!sent) {
@@ -2785,9 +2809,8 @@ async function getSkillListingAttachments(
     sentSkillNames.set(agentKey, sent)
   }
 
-  // Resume path: prior process already injected a listing; it's in the
-  // transcript. Mark everything current as sent so only post-resume deltas
-  // (skills loaded later via /reload-plugins etc) get announced.
+  // resume 场景：上一个进程已在转录里发过清单。把现存全部标记为已发送，
+  // 本轮返回空——之后 /reload-plugins 等新增的 skill 才会作为增量播报。
   if (suppressNext) {
     suppressNext = false
     for (const cmd of allCommands) {
@@ -2796,17 +2819,17 @@ async function getSkillListingAttachments(
     return []
   }
 
-  // Find skills we haven't sent yet
+  // 过滤出还没发过的 skill —— 重复发送只会白白吃上下文
   const newSkills = allCommands.filter(cmd => !sent.has(cmd.name))
 
   if (newSkills.length === 0) {
     return []
   }
 
-  // If no skills have been sent yet, this is the initial batch
+  // 一个都没发过 → 这是会话首轮的全量清单（isInitial 标记进附件元数据）
   const isInitial = sent.size === 0
 
-  // Mark as sent
+  // 先记账再打包：即使后面格式化失败，下轮也不会重发同一批
   for (const cmd of newSkills) {
     sent.add(cmd.name)
   }
@@ -2815,7 +2838,8 @@ async function getSkillListingAttachments(
     `Sending ${newSkills.length} skills via attachment (${isInitial ? 'initial' : 'dynamic'}, ${sent.size} total sent)`,
   )
 
-  // Format within budget using existing logic
+  // 按当前模型上下文窗口折算 token 预算，把清单压进预算内
+  // 格式：每行「- 名字: 描述」，超预算时截断（formatCommandsWithinBudget）
   const contextWindowTokens = getContextWindowForModel(
     toolUseContext.options.mainLoopModel,
     getSdkBetas(),

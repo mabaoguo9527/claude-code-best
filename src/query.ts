@@ -574,23 +574,6 @@ async function* queryLoop(
     //    原始输出对象仅供 UI 渲染，留着会让长会话内存无限增长。
     //    必须拷贝而非原地删除 —— 消息与 UI 状态共享引用，原地改会把正在渲染的
     //    工具结果行变成空白
-    // Release toolUseResult payloads from previous turns — the next API call
-    // only needs message.message.content (tool_result blocks), not the raw
-    // output object. This prevents unbounded memory growth in long sessions
-    // before compact triggers (a single FileRead of a 400KB file would
-    // otherwise stay in mutableMessages forever).
-    //
-    // IMPORTANT: shallow-copy rather than mutate. messagesForQuery elements
-    // are references shared with mutableMessages (UI state); deleting
-    // toolUseResult in place strips it from the live message while React may
-    // still be rendering it. The next query can start within milliseconds of
-    // tool_result creation (model immediately calls the next tool), before
-    // the UI commit lands — UserToolSuccessMessage reads
-    // message.toolUseResult to delegate to tool.renderToolResultMessage, so a
-    // mutation race makes tool-result rows render blank. Map to a stripped
-    // copy so mutableMessages keeps the original for the UI; downstream API
-    // transformations (applyToolResultBudget, snip, microcompact) already
-    // build new arrays via .map(), so they compose cleanly with this copy.
     messagesForQuery = messagesForQuery.map(msg => {
       if (
         msg.type !== 'user' ||
@@ -609,13 +592,6 @@ async function* queryLoop(
 
     // ③ 工具结果预算：限制聚合后的工具结果体积（先于微压缩执行，二者互不干扰）；
     //    仅对会读回记录的 querySource（子代理/主线程会话）持久化替换记录
-    // Enforce per-message budget on aggregate tool result size. Runs BEFORE
-    // microcompact — cached MC operates purely by tool_use_id (never inspects
-    // content), so content replacement is invisible to it and the two compose
-    // cleanly. No-ops when contentReplacementState is undefined (feature off).
-    // Persist only for querySources that read records back on resume: agentId
-    // routes to sidechain file (AgentTool resume) or session file (/resume).
-    // Ephemeral runForkedAgent callers (agent_summary etc.) don't persist.
     const persistReplacements =
       querySource.startsWith('agent:') ||
       querySource.startsWith('repl_main_thread')
@@ -638,10 +614,6 @@ async function* queryLoop(
 
     // ④ Snip 压缩（HISTORY_SNIP）：按条裁剪可牺牲的旧历史；
     //    释放的 token 数要传给自动压缩阈值判断（仅靠 usage 估算看不到）
-    // Apply snip before microcompact (both may run — they are not mutually exclusive).
-    // snipTokensFreed is plumbed to autocompact so its threshold check reflects
-    // what snip removed; tokenCountWithEstimation alone can't see it (reads usage
-    // from the protected-tail assistant, which survives snip unchanged).
     let snipTokensFreed = 0
     if (feature('HISTORY_SNIP')) {
       queryCheckpoint('query_snip_start')
@@ -656,7 +628,6 @@ async function* queryLoop(
 
     // ⑤ 微压缩：只压缩工具结果等小块；被清空的工具同步删除其内容替换记录。
     //    缓存式微压缩的边界消息推迟到拿到 API 实报删除量后再补发
-    // Apply microcompact before autocompact
     queryCheckpoint('query_microcompact_start')
     const microcompactResult = await deps.microcompact(
       messagesForQuery,
@@ -683,19 +654,6 @@ async function* queryLoop(
     queryCheckpoint('query_microcompact_end')
 
     // ⑥ 上下文折叠（CONTEXT_COLLAPSE）：读时投影折叠视图并按需提交新折叠；
-    //    先于自动压缩执行 —— 若折叠已足够省，就保留细粒度上下文而非整段摘要
-    // Project the collapsed context view and maybe commit more collapses.
-    // Runs BEFORE autocompact so that if collapse gets us under the
-    // autocompact threshold, autocompact is a no-op and we keep granular
-    // context instead of a single summary.
-    //
-    // Nothing is yielded — the collapsed view is a read-time projection
-    // over the REPL's full history. Summary messages live in the collapse
-    // store, not the REPL array. This is what makes collapses persist
-    // across turns: projectView() replays the commit log on every entry.
-    // Within a turn, the view flows forward via state.messages at the
-    // continue site (query.ts:1192), and the next projectView() no-ops
-    // because the archived messages are already gone from its input.
     if (feature('CONTEXT_COLLAPSE') && contextCollapse) {
       const collapseResult = await contextCollapse.applyCollapsesIfNeeded(
         messagesForQuery,
